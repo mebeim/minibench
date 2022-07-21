@@ -1,9 +1,9 @@
 Minibench
 =========
 
-Minimalistic runtime benchmarking utility written in plain C99. It is meant to
-run on a Linux system, though it will probably also compile and run on other
-Unix-like systems.
+Minimalistic runtime benchmarking utility for Linux written in plain C99.
+
+<p align="center"><img title="Screenshot" src="screenshot.png"></img></p>
 
 Design goals:
 
@@ -20,6 +20,9 @@ Design goals:
 
 Building and installation
 -------------------------
+
+Minibench is designed to run on a Linux system, though it will probably also
+compile and run on other Unix-like systems.
 
 Use `make` to build, `make install` to install, and `make uninstall` to
 uninstall. Installing will simply create a copy of the compiled `bench` binary
