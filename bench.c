@@ -34,7 +34,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.0"
+#define VERSION_STR "1.0.1"
 
 #define err(str)       fprintf(stderr, "%s: " str, name)
 #define errf(fmt, ...) fprintf(stderr, "%s: " fmt, name, __VA_ARGS__)
@@ -45,13 +45,8 @@
 #define MAX_CHILD_WARNINGS 3
 
 // Max number of measurements we are willing to hold in memory in order to be
-// able to calculate a median (1M measurements is 24MB)
+// able to calculate a median (1M measurements is 32MB)
 #define MAX_MEASUREMENTS (1 * 1000 * 1000)
-
-struct cputime {
-	double user;
-	double sys;
-};
 
 struct running_stats {
 	double tot;
@@ -59,6 +54,7 @@ struct running_stats {
 	double max;
 	double avg;
 	double m2;
+	double *hist;
 };
 
 static char *name;
@@ -67,13 +63,10 @@ static unsigned child_warnings;
 static unsigned long count = 1;
 static unsigned long wup_count;
 
-struct running_stats wall     = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu      = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu_user = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu_sys  = {.min = INFINITY, .max = -INFINITY};
-
-static double *wall_hist;
-static struct cputime *cpu_hist;
+struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
+struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
+struct running_stats cpu_user_stats = {.min = INFINITY, .max = -INFINITY};
+struct running_stats cpu_sys_stats  = {.min = INFINITY, .max = -INFINITY};
 
 /**
  * Print version information and exit.
@@ -184,61 +177,31 @@ static void update_stats_single(struct running_stats *stats, const unsigned long
 		stats->min = cur;
 	if (cur > stats->max)
 		stats->max = cur;
+	if (stats->hist)
+		stats->hist[iteration] = cur;
 }
 
 /**
  * Update all running statistics and save measurements for later calculation if
  * needed.
  */
-static void update_stats(const unsigned long iteration, const double cur_wall, const double cur_cpu_user, const double cur_cpu_sys) {
-	update_stats_single(&wall    , iteration, cur_wall);
-	update_stats_single(&cpu     , iteration, cur_cpu_user + cur_cpu_sys);
-	update_stats_single(&cpu_user, iteration, cur_cpu_user);
-	update_stats_single(&cpu_sys , iteration, cur_cpu_sys);
-
-	if (wall_hist && cpu_hist) {
-		wall_hist[iteration] = cur_wall;
-		cpu_hist[iteration] = (struct cputime){cur_cpu_user, cur_cpu_sys};
-	}
+static void update_stats(const unsigned long iteration, const double wall, const double cpu_user, const double cpu_sys) {
+	const double cpu = cpu_user + cpu_sys;
+	update_stats_single(&wall_stats    , iteration, wall);
+	update_stats_single(&cpu_stats     , iteration, cpu);
+	update_stats_single(&cpu_user_stats, iteration, cpu_user);
+	update_stats_single(&cpu_sys_stats , iteration, cpu_sys);
 }
 
 /**
- * Compare function for qsort for wall time measurements.
+ * Compare function for qsort.
  */
-static int cmp_wall(const void *a, const void *b) {
-	const double ta = *(const double *)a;
-	const double tb = *(const double *)b;
-	return (ta > tb) ? 1 : ((ta < tb) ? -1 : 0);
+static int cmp(const void *a, const void *b) {
+	const double da = *(const double *)a;
+	const double db = *(const double *)b;
+	return (da > db) - (da < db);
 }
 
-/**
- * Compare function for qsort for cumulative CPU time measurements (user + sys).
- */
-static int cmp_cpu(const void *a, const void *b) {
-	const struct cputime *ca = (const struct cputime *)a;
-	const struct cputime *cb = (const struct cputime *)b;
-	const double ta = ca->user + ca->sys;
-	const double tb = cb->user + cb->sys;
-	return (ta > tb) - (ta < tb);
-}
-
-/**
- * Compare function for qsort for user CPU time measurements.
- */
-static int cmp_cpu_user(const void *a, const void *b) {
-	const struct cputime *ca = (const struct cputime *)a;
-	const struct cputime *cb = (const struct cputime *)b;
-	return (ca->user > cb->user) - (ca->user < cb->user);
-}
-
-/**
- * Compare function for qsort for system CPU time measurements.
- */
-static int cmp_cpu_sys(const void *a, const void *b) {
-	const struct cputime *ca = (const struct cputime *)a;
-	const struct cputime *cb = (const struct cputime *)b;
-	return (ca->sys > cb->sys) - (ca->sys < cb->sys);
-}
 /**
  * Finalize statistics with appropriate calculations and pretty-print a detailed
  * timing report.
@@ -252,58 +215,48 @@ static void timing_report(void) {
 	if (count == 1) {
 		fputs("\n------------------------------------------------\n", stderr);
 		fputs("         Wall        CPU       User     System\nTime  ", stderr);
-		pptime(wall.tot);     fputs("  ", stderr);
-		pptime(cpu.tot);      fputs("  ", stderr);
-		pptime(cpu_user.tot); fputs("  ", stderr);
-		pptime(cpu_sys.tot);  fputc('\n', stderr);
+		pptime(wall_stats.tot);     fputs("  ", stderr);
+		pptime(cpu_stats.tot);      fputs("  ", stderr);
+		pptime(cpu_user_stats.tot); fputs("  ", stderr);
+		pptime(cpu_sys_stats.tot);  fputc('\n', stderr);
 		return;
 	}
 
 	fprintf(stderr, "\n-----------[ Timing report for %ld runs ]------------\n", count);
 	fputs("            Wall        CPU       User     System\nTotal    ", stderr);
-	pptime(wall.tot);     fputs("  ", stderr);
-	pptime(cpu.tot);      fputs("  ", stderr);
-	pptime(cpu_user.tot); fputs("  ", stderr);
-	pptime(cpu_sys.tot);  fputc('\n', stderr);
+	pptime(wall_stats.tot);     fputs("  ", stderr);
+	pptime(cpu_stats.tot);      fputs("  ", stderr);
+	pptime(cpu_user_stats.tot); fputs("  ", stderr);
+	pptime(cpu_sys_stats.tot);  fputc('\n', stderr);
 
-	wall_std     = sqrt(wall.m2 / count);
-	cpu_std      = sqrt(cpu.m2 / count);
-	cpu_user_std = sqrt(cpu_user.m2 / count);
-	cpu_sys_std  = sqrt(cpu_sys.m2 / count);
+	wall_std     = sqrt(wall_stats.m2 / count);
+	cpu_std      = sqrt(cpu_stats.m2 / count);
+	cpu_user_std = sqrt(cpu_user_stats.m2 / count);
+	cpu_sys_std  = sqrt(cpu_sys_stats.m2 / count);
 
-	if (wall_hist && cpu_hist) {
+	if (wall_stats.hist) {
 		const unsigned long mid = count / 2;
 		double wall_mid, cpu_mid, cpu_user_mid, cpu_sys_mid;
 
 		// It's possible to find the median in linear time without sorting using
 		// quickselect, but for reasonable values of count (<= 1M) it's just not
 		// worth the effort to implement that.
-		qsort(wall_hist, count, sizeof(*wall_hist), cmp_wall);
-		qsort(cpu_hist, count, sizeof(*cpu_hist), cmp_cpu);
+		qsort(wall_stats.hist    , count, sizeof(*wall_stats.hist)    , cmp);
+		qsort(cpu_stats.hist     , count, sizeof(*cpu_stats.hist)     , cmp);
+		qsort(cpu_user_stats.hist, count, sizeof(*cpu_user_stats.hist), cmp);
+		qsort(cpu_sys_stats.hist , count, sizeof(*cpu_sys_stats.hist) , cmp);
 
 		if (count % 2) {
-			wall_mid = wall_hist[mid];
-			cpu_mid  = cpu_hist[mid].user + cpu_hist[mid].sys;
+			wall_mid     = wall_stats.hist[mid];
+			cpu_mid      = cpu_stats.hist[mid];
+			cpu_user_mid = cpu_user_stats.hist[mid];
+			cpu_sys_mid  = cpu_sys_stats.hist[mid];
 		} else {
-			wall_mid = (wall_hist[mid - 1] + wall_hist[mid]) / 2;
-			cpu_mid  = cpu_hist[mid - 1].user + cpu_hist[mid].user;
-			cpu_mid += cpu_hist[mid - 1].sys + cpu_hist[mid].sys;
-			cpu_mid /= 2;
+			wall_mid     = (wall_stats.hist[mid - 1] + wall_stats.hist[mid]) / 2;
+			cpu_mid      = (cpu_stats.hist[mid - 1] + cpu_stats.hist[mid]) / 2;
+			cpu_user_mid = (cpu_user_stats.hist[mid - 1] + cpu_user_stats.hist[mid]) / 2;
+			cpu_sys_mid  = (cpu_sys_stats.hist[mid - 1] + cpu_sys_stats.hist[mid]) / 2;
 		}
-
-		qsort(cpu_hist, count, sizeof(*cpu_hist), cmp_cpu_user);
-
-		if (count % 2)
-			cpu_user_mid = cpu_hist[mid].user;
-		else
-			cpu_user_mid = (cpu_hist[mid - 1].user + cpu_hist[mid].user) / 2;
-
-		qsort(cpu_hist, count, sizeof(*cpu_hist), cmp_cpu_sys);
-
-		if (count % 2)
-			cpu_sys_mid = cpu_hist[mid].sys;
-		else
-			cpu_sys_mid = (cpu_hist[mid - 1].sys + cpu_hist[mid].sys) / 2;
 
 		fputs("Median   ", stderr);
 		pptime(wall_mid);     fputs("  ", stderr);
@@ -313,10 +266,10 @@ static void timing_report(void) {
 	}
 
 	fputs("Average  ", stderr);
-	pptime(wall.avg);     fputs("  ", stderr);
-	pptime(cpu.avg);      fputs("  ", stderr);
-	pptime(cpu_user.avg); fputs("  ", stderr);
-	pptime(cpu_sys.avg);  fputc('\n', stderr);
+	pptime(wall_stats.avg);     fputs("  ", stderr);
+	pptime(cpu_stats.avg);      fputs("  ", stderr);
+	pptime(cpu_user_stats.avg); fputs("  ", stderr);
+	pptime(cpu_sys_stats.avg);  fputc('\n', stderr);
 
 	fputs("Std dev  ", stderr);
 	pptime(wall_std);     fputs("  ", stderr);
@@ -325,16 +278,16 @@ static void timing_report(void) {
 	pptime(cpu_sys_std);  fputc('\n', stderr);
 
 	fputs("Minimum  ", stderr);
-	pptime(wall.min);     fputs("  ", stderr);
-	pptime(cpu.min);      fputs("  ", stderr);
-	pptime(cpu_user.min); fputs("  ", stderr);
-	pptime(cpu_sys.min);  fputc('\n', stderr);
+	pptime(wall_stats.min);     fputs("  ", stderr);
+	pptime(cpu_stats.min);      fputs("  ", stderr);
+	pptime(cpu_user_stats.min); fputs("  ", stderr);
+	pptime(cpu_sys_stats.min);  fputc('\n', stderr);
 
 	fputs("Maximum  ", stderr);
-	pptime(wall.max);     fputs("  ", stderr);
-	pptime(cpu.max);      fputs("  ", stderr);
-	pptime(cpu_user.max); fputs("  ", stderr);
-	pptime(cpu_sys.max);  fputc('\n', stderr);
+	pptime(wall_stats.max);     fputs("  ", stderr);
+	pptime(cpu_stats.max);      fputs("  ", stderr);
+	pptime(cpu_user_stats.max); fputs("  ", stderr);
+	pptime(cpu_sys_stats.max);  fputc('\n', stderr);
 }
 
 /**
@@ -390,7 +343,7 @@ inline static int run_child(char *const *argv, const int out_fd, const int err_p
 		// a false positive. Furthermore, we can't print anything here since the
 		// above dup2 calls could point std{out,err} to /dev/null. Using a pipe
 		// is a neat and reliable way of solving the problem.
-		write(err_pipe_fd, &errno, sizeof(int));
+		write(err_pipe_fd, &errno, sizeof(errno));
 		_exit(EXIT_FAILURE);
 	}
 
@@ -442,30 +395,29 @@ static void check_child_exit(const int child_status, const int *child_pipe, bool
 		return;
 
 	if (signaled || stopped) {
-		const char *sigdesc;
-		int signo;
+		if (child_warnings < MAX_CHILD_WARNINGS) {
+			const char *sigdesc;
+			int signo;
+
+			signo = signaled ? WTERMSIG(child_status) : WSTOPSIG(child_status);
+			sigdesc = strsignal(signo);
+
+			if (!sigdesc)
+				sigdesc = "unknown signal";
+
+			if (signaled) {
+				errf("child terminated by signal %d (%s)\n", signo, sigdesc);
+			} else {
+				errf("child stopped by signal %d (%s), %s\n", signo, sigdesc,
+					keep_alive ? "kept alive" : "forcibly killing it");
+			}
+
+			if (++child_warnings >= MAX_CHILD_WARNINGS)
+				err("suppressing any further warnings\n");
+		}
 
 		if (stopped && !keep_alive && kill(child_pid, SIGKILL) == -1)
 			errf_exit("failed to kill stopped child process (PID=%d)\n", child_pid);
-
-		if (child_warnings >= MAX_CHILD_WARNINGS)
-			return;
-
-		signo = signaled ? WTERMSIG(child_status) : WSTOPSIG(child_status);
-		sigdesc = strsignal(signo);
-
-		if (!sigdesc)
-			sigdesc = "unknown signal";
-
-		if (signaled) {
-			errf("child terminated by signal %d (%s)\n", signo, sigdesc);
-		} else {
-			errf("child stopped by signal %d (%s), %s\n", signo, sigdesc,
-				keep_alive ? "kept alive" : "forcibly killed");
-		}
-
-		if (++child_warnings >= MAX_CHILD_WARNINGS)
-			err("suppressing any further warnings\n");
 	} else {
 		// We should never get here as we don't specify WCONTINUED in wait4
 		errf_exit("bad child process status after waiting: 0x%x (bug?)\n", child_status);
@@ -526,10 +478,13 @@ int main(int argc, char *argv[]) {
 	// If count permits, we can also keep track of all measurements to later
 	// calculate the median
 	if (count > 1 && count <= MAX_MEASUREMENTS) {
-		wall_hist = malloc(sizeof(*wall_hist) * count);
-		cpu_hist = malloc(sizeof(*cpu_hist) * count);
+		wall_stats.hist = malloc(sizeof(*wall_stats.hist) * count * 4);
 
-		if (!wall_hist || !cpu_hist) {
+		if (wall_stats.hist) {
+			cpu_stats.hist      = wall_stats.hist     + count;
+			cpu_user_stats.hist = cpu_stats.hist      + count;
+			cpu_sys_stats.hist  = cpu_user_stats.hist + count;
+		} else {
 			errf("failed allocating history buffers: %s\n", strerror(errno));
 			err("skipping median calculation\n");
 		}
