@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <time.h>
 #include <math.h>
+#include <limits.h>
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -34,12 +35,16 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.0.1"
+#define VERSION_STR "1.1"
 
-#define err(str)       fprintf(stderr, "%s: " str, name)
-#define errf(fmt, ...) fprintf(stderr, "%s: " fmt, name, __VA_ARGS__)
-#define err_exit(str)       do { fprintf(stderr, "%s: " str, name); exit(EXIT_FAILURE); } while(0)
-#define errf_exit(fmt, ...) do { fprintf(stderr, "%s: " fmt, name, __VA_ARGS__); exit(EXIT_FAILURE); } while(0)
+// Wrap the real function passing caller line number as argument in order to be
+// able to track down errors
+#define restore_stderr() restore_stderr_track_caller(__LINE__)
+
+#define err(str)            do { restore_stderr(); fprintf(stderr, "%s: " str, name); } while(0)
+#define errf(fmt, ...)      do { restore_stderr(); fprintf(stderr, "%s: " fmt, name, __VA_ARGS__); } while(0)
+#define err_exit(str)       do { restore_stderr(); fprintf(stderr, "%s: " str, name); exit(EXIT_FAILURE); } while(0)
+#define errf_exit(fmt, ...) do { restore_stderr(); fprintf(stderr, "%s: " fmt, name, __VA_ARGS__); exit(EXIT_FAILURE); } while(0)
 
 // Max number of warnings to print for child termination/stop by signal
 #define MAX_CHILD_WARNINGS 3
@@ -62,11 +67,12 @@ static pid_t child_pid;
 static unsigned child_warnings;
 static unsigned long count = 1;
 static unsigned long wup_count;
+static int saved_stderr = -1;
 
-struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu_user_stats = {.min = INFINITY, .max = -INFINITY};
-struct running_stats cpu_sys_stats  = {.min = INFINITY, .max = -INFINITY};
+static struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
+static struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
+static struct running_stats cpu_user_stats = {.min = INFINITY, .max = -INFINITY};
+static struct running_stats cpu_sys_stats  = {.min = INFINITY, .max = -INFINITY};
 
 /**
  * Print version information and exit.
@@ -106,7 +112,10 @@ static void help_exit(void) {
 /**
  * Print brief usage information and exit.
  */
-static void usage_exit(void) {
+static void usage_exit(const char *msg) {
+	if (msg)
+		fputs(msg, stderr);
+
 	fprintf(stderr, "Usage: %s [-hkqQv] [-n COUNT] [-w COUNT] PROGRAM [ARGS...]\n", name);
 	fprintf(stderr, "See '%s -h' for more information.\n", name);
 	exit(EXIT_FAILURE);
@@ -122,20 +131,12 @@ static unsigned long validate_count(const char *s) {
 
 	count = strtol(s, &endp, 0);
 
-	if (endp == s || *endp) {
-		err("invalid count: not an integer\n");
-		usage_exit();
-	}
-
-	if (errno == ERANGE) {
-		err("invalid count: value too large\n");
-		usage_exit();
-	}
-
-	if (count < 1) {
-		err("invalid count: value must be positive\n");
-		usage_exit();
-	}
+	if (endp == s || *endp)
+		usage_exit("invalid count: not an integer\n");
+	if (errno == ERANGE)
+		usage_exit("invalid count: value too large\n");
+	if (count < 1)
+		usage_exit("invalid count: value must be positive\n");
 
 	return (unsigned long)count;
 }
@@ -291,21 +292,87 @@ static void timing_report(void) {
 }
 
 /**
- * Get precise wall-time clock from clock_gettime and convert to double.
+ * Restore previously duped stderr file descriptor to STDERR_FILENO if needed.
  */
-static inline double wall_time(void) {
-	struct timespec ts;
+static void restore_stderr_track_caller(int caller_lineno) {
+	if (saved_stderr == -1)
+		return;
 
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
-		errf_exit("clock_gettime failed: %s\n", strerror(errno));
+	if (dup2(saved_stderr, STDERR_FILENO) == -1) {
+		const char *fmt = ": unable to restore stderr (line %d): %s\n";
+		char msg[256] = {0};
 
-	// Overhead of this simple calculation should really be negligible
-	return ts.tv_sec * 1e9 + ts.tv_nsec;
+		snprintf(msg, sizeof(msg), fmt, caller_lineno, strerror(errno));
+		write(saved_stderr, name, strlen(name));
+		write(saved_stderr, msg, strlen(msg));
+		exit(EXIT_FAILURE);
+	}
+}
+
+/**
+ * Redirect stdout and stderr to /dev/null in order to mute the child process.
+ * Duplicate and save stderr on the first call to be able to restore it later.
+ */
+static void redirect_to_devnull(void) {
+	static int devnull_fd = INT_MIN;
+
+	// This seemingly weird juggling of file descriptors is useful to avoid any
+	// syscall between fork and exec. We will exec the child with stdout and
+	// stderr already pointing to /dev/null. Any other unneeded file descriptor
+	// will have CLOEXEC set and will be wiped out on exec.
+
+	if (devnull_fd == INT_MIN) {
+		devnull_fd = open("/dev/null", O_WRONLY|O_CLOEXEC);
+		if (devnull_fd == -1) {
+			errf("unable to open /dev/null: %s\n", strerror(errno));
+			err("child process stdout/stderr will not be redirected\n");
+			return;
+		}
+
+		// No need to save stdout as we will only write to stderr from now on
+		dup2(devnull_fd, STDOUT_FILENO);
+
+		// Save stderr to restore it later if needed, do not error out in case
+		// of failure as we are merely trying to accomodate the user
+		if ((saved_stderr = dup(STDERR_FILENO)) != -1)
+			fcntl(saved_stderr, F_SETFD, FD_CLOEXEC);
+	}
+
+	// Only mute stderr if we were able to save it, or we will completely lose
+	// the ability to produce output
+	if (saved_stderr != -1)
+		dup2(devnull_fd, STDERR_FILENO);
+}
+
+/**
+ * Set up file descriptors so that the child process will be muted. There can be
+ * two levels: 1 = redirect child stdout and stderr to /dev/null; 2 = close
+ * child stdout and stderr setting FD_CLOEXEC on them in the parent.
+ */
+static void mute_child(unsigned level) {
+	static bool cloexec_done = false;
+
+	// This will need to be done once before each run, because we could have
+	// restored stderr for printing a warning between any two runs
+	if (level == 1) {
+		redirect_to_devnull();
+		return;
+	}
+
+	// This only needs to be done once as it's persistent
+	if (!cloexec_done && level == 2) {
+		if (fcntl(STDOUT_FILENO, F_SETFD, FD_CLOEXEC) == -1)
+			errf("unable to close stdout for child process: %s\n", strerror(errno));
+		if (fcntl(STDERR_FILENO, F_SETFD, FD_CLOEXEC) == -1)
+			errf("unable to close stderr for child process: %s\n", strerror(errno));
+
+		cloexec_done = true;
+	}
 }
 
 /**
  * Create a pipe for the child process to report execve failure and set
- * O_CLOEXEC on both ends so that they are automatically closed on successful
+ * FD_CLOEXEC on both ends so that they are automatically closed on successful
  * execve.
  */
 static void create_pipe(int *fds) {
@@ -321,20 +388,14 @@ static void create_pipe(int *fds) {
  * Run child program once, report exit status and resource usage if needed,
  * communicate errno to the parent on execve failure. This function should do
  * the least amount of work possible before forking and after waiting for the
- * child in order to minimize delays in wall clock measurements.
+ * child in order to minimize delays in time measurements.
  */
-inline static int run_child(char *const *argv, const int out_fd, const int err_pipe_fd, struct rusage *rusage) {
+inline static int run_child(char *const *argv, const int err_pipe_fd, struct rusage *rusage) {
 	int child_status;
 
 	child_pid = fork();
 
 	if (child_pid == 0) {
-		if (out_fd != -1) {
-			// Don't error out here, we are merely trying to accomodate the user
-			dup2(out_fd, STDOUT_FILENO);
-			dup2(out_fd, STDERR_FILENO);
-		}
-
 		execvp(*argv, argv);
 
 		// We need to communicate failure to the parent in order to abort
@@ -351,8 +412,7 @@ inline static int run_child(char *const *argv, const int out_fd, const int err_p
 		errf_exit("fork failed: %s\n", strerror(errno));
 
 	// Prefer wait4 to wait + clock_gettime(CLOCK_PROCESS_CPUTIME_ID)
-	child_pid = wait4(child_pid, &child_status, WUNTRACED, rusage);
-	if (child_pid == -1)
+	if (wait4(child_pid, &child_status, WUNTRACED, rusage) == -1)
 		errf_exit("wait4 failed: %s\n", strerror(errno));
 
 	// Delay child status checking to the caller to avoid wasting time before
@@ -424,9 +484,21 @@ static void check_child_exit(const int child_status, const int *child_pipe, bool
 	}
 }
 
+/**
+ * Get precise wall-clock time from clock_gettime and convert to double.
+ */
+static inline double wall_time(void) {
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+		errf_exit("clock_gettime failed: %s\n", strerror(errno));
+
+	// Overhead of this simple calculation should really be negligible
+	return ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
 int main(int argc, char *argv[]) {
-	int devnull_fd = -1;
-	unsigned mute_child = 0;
+	unsigned mute_child_level = 0;
 	bool keep_alive_if_stopped = false;
 	int opt, child_status, child_pipe[2];
 	char **child_argv;
@@ -444,12 +516,12 @@ int main(int argc, char *argv[]) {
 				break;
 
 			case 'q':
-				if (mute_child < 1)
-					mute_child = 1;
+				if (mute_child_level < 1)
+					mute_child_level = 1;
 				break;
 
 			case 'Q':
-				mute_child = 2;
+				mute_child_level = 2;
 				break;
 
 			case 'k':
@@ -465,13 +537,13 @@ int main(int argc, char *argv[]) {
 				break;
 
 			default:
-				usage_exit();
+				usage_exit(NULL);
 				break;
 		}
 	}
 
 	if (optind >= argc)
-		usage_exit();
+		usage_exit("need to specify a program to benchmark\n");
 
 	child_argv = argv + optind;
 
@@ -490,26 +562,11 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	// Don't error out here, we are merely trying to accomodate the user
-	if (mute_child) {
-		if (mute_child == 1) {
-			devnull_fd = open("/dev/null", O_WRONLY|O_CLOEXEC);
-			if (devnull_fd == -1) {
-				errf("unable to open /dev/null: %s\n", strerror(errno));
-				err("child process stdout/stderr will not be redirected\n");
-			}
-		} else {
-			if (fcntl(STDOUT_FILENO, F_SETFD, FD_CLOEXEC) == -1)
-				errf("unable to close stdout for child process: %s\n", strerror(errno));
-			if (fcntl(STDERR_FILENO, F_SETFD, FD_CLOEXEC) == -1)
-				errf("unable to close stderr for child process: %s\n", strerror(errno));
-		}
-	}
-
 	for (unsigned long i = 0; i < wup_count; i++) {
 		fflush(stderr);
+		mute_child(mute_child_level);
 		create_pipe(child_pipe);
-		child_status = run_child(child_argv, devnull_fd, child_pipe[1], NULL);
+		child_status = run_child(child_argv, child_pipe[1], NULL);
 		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
 	}
 
@@ -518,10 +575,11 @@ int main(int argc, char *argv[]) {
 		double cpu_user, cpu_sys, wall;
 
 		fflush(stderr);
+		mute_child(mute_child_level);
 		create_pipe(child_pipe);
 
 		wall = wall_time();
-		child_status = run_child(child_argv, devnull_fd, child_pipe[1], &child_rusage);
+		child_status = run_child(child_argv, child_pipe[1], &child_rusage);
 		wall = wall_time() - wall;
 
 		cpu_user = child_rusage.ru_utime.tv_sec * 1e9 + child_rusage.ru_utime.tv_usec * 1e3;
@@ -531,6 +589,7 @@ int main(int argc, char *argv[]) {
 		update_stats(i, wall, cpu_user, cpu_sys);
 	}
 
+	restore_stderr();
 	timing_report();
 
 	return WIFEXITED(child_status) ? WEXITSTATUS(child_status) : EXIT_SUCCESS;
