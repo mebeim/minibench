@@ -1,4 +1,4 @@
-CFLAGS  := -std=c99 -O3 -march=native -Wall -Wextra -pedantic -pedantic-errors
+CFLAGS  := -std=c99 -O3 -Wall -Wextra -pedantic -pedantic-errors
 LDFLAGS := -Wl,-z,relro,-z,now -lm
 
 .PHONY: clean install uninstall
@@ -8,7 +8,7 @@ bench: bench.c
 	strip -R.comment $@
 
 install: bench
-	install bench $$HOME/.local/bin
+	install $< $$HOME/.local/bin
 
 uninstall:
 	rm -f $$HOME/.local/bin/bench
