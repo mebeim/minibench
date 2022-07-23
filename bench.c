@@ -26,7 +26,6 @@
 #include <time.h>
 #include <math.h>
 #include <limits.h>
-#include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -35,7 +34,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.1"
+#define VERSION_STR "1.1.1"
 
 // Wrap the real function passing caller line number as argument in order to be
 // able to track down errors
@@ -485,16 +484,11 @@ static void check_child_exit(const int child_status, const int *child_pipe, bool
 }
 
 /**
- * Get precise wall-clock time from clock_gettime and convert to double.
+ * Get precise wall-clock time from clock_gettime.
  */
-static inline double wall_time(void) {
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+static inline void wall_time(struct timespec *out) {
+	if (clock_gettime(CLOCK_MONOTONIC, out) == -1)
 		errf_exit("clock_gettime failed: %s\n", strerror(errno));
-
-	// Overhead of this simple calculation should really be negligible
-	return ts.tv_sec * 1e9 + ts.tv_nsec;
 }
 
 int main(int argc, char *argv[]) {
@@ -572,21 +566,23 @@ int main(int argc, char *argv[]) {
 
 	for (unsigned long i = 0; i < count; i++) {
 		struct rusage child_rusage;
-		double cpu_user, cpu_sys, wall;
+		struct timespec wstart, wend;
+		double wall, cpu_user, cpu_sys;
 
 		fflush(stderr);
 		mute_child(mute_child_level);
 		create_pipe(child_pipe);
 
-		wall = wall_time();
+		wall_time(&wstart);
 		child_status = run_child(child_argv, child_pipe[1], &child_rusage);
-		wall = wall_time() - wall;
+		wall_time(&wend);
 
+		wall     = wend.tv_sec * 1e9 + wend.tv_nsec - wstart.tv_sec * 1e9 - wstart.tv_nsec;
 		cpu_user = child_rusage.ru_utime.tv_sec * 1e9 + child_rusage.ru_utime.tv_usec * 1e3;
 		cpu_sys  = child_rusage.ru_stime.tv_sec * 1e9 + child_rusage.ru_stime.tv_usec * 1e3;
 
-		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
 		update_stats(i, wall, cpu_user, cpu_sys);
+		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
 	}
 
 	restore_stderr();
