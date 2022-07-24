@@ -293,7 +293,7 @@ static void timing_report(void) {
 /**
  * Restore previously duped stderr file descriptor to STDERR_FILENO if needed.
  */
-static void restore_stderr_track_caller(int caller_lineno) {
+static void restore_stderr_track_caller(const int caller_lineno) {
 	if (saved_stderr == -1)
 		return;
 
@@ -348,8 +348,8 @@ static void redirect_to_devnull(void) {
  * two levels: 1 = redirect child stdout and stderr to /dev/null; 2 = close
  * child stdout and stderr setting FD_CLOEXEC on them in the parent.
  */
-static void mute_child(unsigned level) {
-	static bool cloexec_done = false;
+static void mute_child(const unsigned level) {
+	static bool cloexec_once = false;
 
 	// This will need to be done once before each run, because we could have
 	// restored stderr for printing a warning between any two runs
@@ -359,13 +359,13 @@ static void mute_child(unsigned level) {
 	}
 
 	// This only needs to be done once as it's persistent
-	if (!cloexec_done && level == 2) {
+	if (cloexec_once && level == 2) {
 		if (fcntl(STDOUT_FILENO, F_SETFD, FD_CLOEXEC) == -1)
 			errf("unable to close stdout for child process: %s\n", strerror(errno));
 		if (fcntl(STDERR_FILENO, F_SETFD, FD_CLOEXEC) == -1)
 			errf("unable to close stderr for child process: %s\n", strerror(errno));
 
-		cloexec_done = true;
+		cloexec_once = false;
 	}
 }
 
@@ -423,7 +423,7 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, struct rus
  * Check child exit status, warn and forcibly kill child if needed, close both
  * ends of the pipe used by the child to report execve failure.
  */
-static void check_child_exit(const int child_status, const int *child_pipe, bool keep_alive) {
+static void check_child_exit(const int child_status, const int *child_pipe, const bool keep_alive) {
 	bool signaled = WIFSIGNALED(child_status);
 	bool stopped = WIFSTOPPED(child_status);
 	int child_errno;
@@ -581,8 +581,8 @@ int main(int argc, char *argv[]) {
 		cpu_user = child_rusage.ru_utime.tv_sec * 1e9 + child_rusage.ru_utime.tv_usec * 1e3;
 		cpu_sys  = child_rusage.ru_stime.tv_sec * 1e9 + child_rusage.ru_stime.tv_usec * 1e3;
 
-		update_stats(i, wall, cpu_user, cpu_sys);
 		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
+		update_stats(i, wall, cpu_user, cpu_sys);
 	}
 
 	restore_stderr();
