@@ -88,9 +88,10 @@ static void version_exit(void) {
  * Print full help and exit.
  */
 static void help_exit(void) {
-	printf("Usage: %s [-hkqQv] [-n COUNT] [-w COUNT] PROGRAM [ARGS...]\n", name);
-	puts("Benchmark the running time of PROGRAM invoked with the given ARGS.\n");
-	puts(
+	printf(
+		"Usage: %s [-hkqQv] [-n COUNT] [-w COUNT] PROGRAM [ARGS...]\n"
+		"Benchmark the running time of PROGRAM invoked with the given ARGS.\n"
+		"\n"
 		"Command line options:\n"
 		"  -n COUNT  number of runs of the benchmarked program\n"
 		"  -w COUNT  number of warm-up runs of the benchmarked program before timed runs\n"
@@ -100,12 +101,12 @@ static void help_exit(void) {
 		"  -Q        forcibly mute benchmarked program closing its stdout/stderr\n"
 		"  -h        show this help message and exit\n"
 		"  -v        print version information and exit\n"
+		"\n"
+		"The exit status will be the one of the benchmarked program's last run, unless\n"
+		"stopped or killed by a signal, in which case it will be 128 + signal number.\n"
+		"On error, an error message will be printed before exiting with status %d.\n\n",
+		name, EXIT_FAILURE
 	);
-	puts(
-		"Exit status will be the one of the benchmarked program's last run, unless\n"
-		"stopped or killed by a signal, in which case the exit status is 0."
-	);
-	printf("On error, an error message is printed before exiting with status %d.\n\n", EXIT_FAILURE);
 	exit(EXIT_SUCCESS);
 }
 
@@ -659,5 +660,9 @@ int main(int argc, char *argv[]) {
 	restore_stderr();
 	timing_report();
 
-	return WIFEXITED(last_child_status) ? WEXITSTATUS(last_child_status) : EXIT_SUCCESS;
+	if (WIFSIGNALED(last_child_status))
+		return 128 + WTERMSIG(last_child_status);
+	if (WIFSTOPPED(last_child_status))
+		return 128 + WSTOPSIG(last_child_status);
+	return WEXITSTATUS(last_child_status);
 }
