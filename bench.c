@@ -61,12 +61,13 @@ struct running_stats {
 	double *hist;
 };
 
-static char *name;
-static pid_t child_pid;
-static unsigned child_warnings;
-static unsigned long count = 1;
-static unsigned long wup_count;
-static int saved_stderr = -1;
+static char *name;              // Saved argv[0]
+static pid_t child_pid;         // Saved current child PID
+static unsigned child_warnings; // Number of child warnings printed so far
+static unsigned long count = 1; // Number of timed runs to perform
+static unsigned long wup_count; // Number of warm-up runs to perform
+static int saved_stderr = -1;   // Saved stderr FD in case we mute the child
+static unsigned sigints_caught; // Number of SIGINT signals caught
 
 static struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
 static struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
@@ -386,8 +387,8 @@ static void create_pipe(int *fds) {
 /**
  * Run child program once, report exit status and resource usage if needed,
  * communicate errno to the parent on execve failure. This function should do
- * the least amount of work possible before forking and after waiting for the
- * child in order to minimize delays in time measurements.
+ * the least amount of work possible in order to minimize any overhead in time
+ * measurements.
  */
 inline static int run_child(char *const *argv, const int err_pipe_fd, struct rusage *rusage) {
 	int child_status;
@@ -410,9 +411,16 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, struct rus
 	if (child_pid == -1)
 		errf_exit("fork failed: %s\n", strerror(errno));
 
-	// Prefer wait4 to wait + clock_gettime(CLOCK_PROCESS_CPUTIME_ID)
-	if (wait4(child_pid, &child_status, WUNTRACED, rusage) == -1)
-		errf_exit("wait4 failed: %s\n", strerror(errno));
+	while (wait4(child_pid, &child_status, WUNTRACED, rusage) == -1) {
+		if (errno != EINTR)
+			errf_exit("wait4 failed: %s\n", strerror(errno));
+
+		// We caught a SIGINT while waiting. If this was a result of a CTRL+C
+		// from within a shell, a SIGINT was also delivered to the child
+		// process, which will most probably terminate because of it (unless
+		// ignored/blocked or weirdly handled). Continue waiting until either
+		// we are successful or the user gets tired and decides to force quit.
+	}
 
 	// Delay child status checking to the caller to avoid wasting time before
 	// querying the wall clock
@@ -491,10 +499,45 @@ static inline void wall_time(struct timespec *out) {
 		errf_exit("clock_gettime failed: %s\n", strerror(errno));
 }
 
+/**
+ * SIGINT signal handler. Increment global counter to keep track of the number
+ * of SIGINTs handled, print a help message and give the user the option to
+ * forcibly kill the entire process group in case of unresponsiveness.
+ */
+static void handle_sigint(int signo) {
+	(void)signo;
+	sigints_caught++;
+
+	restore_stderr();
+	write(STDERR_FILENO, "\n", 1);
+	write(STDERR_FILENO, name, strlen(name));
+
+	switch (sigints_caught) {
+		case 1:
+			write(STDERR_FILENO, ": caught SIGINT (2 more to forcibly quit)\n", 42);
+			break;
+
+		case 2:
+			write(STDERR_FILENO, ": caught SIGINT (1 more to forcibly quit)\n", 42);
+			break;
+
+		case 3:
+			// This can be useful if the currently running child process
+			// ignores, blocks or weirdly handles SIGINT, refusing to terminate.
+			// Without this functionality, we'd be leaving the user with only
+			// two annoying options: stopping and killing it using job control
+			// commands, or finding and killing it from another shell.
+			write(STDERR_FILENO, ": goodbye!\n", 11);
+			kill(0, SIGKILL);
+			_exit(EXIT_FAILURE);
+			break;
+	}
+}
+
 int main(int argc, char *argv[]) {
 	unsigned mute_child_level = 0;
 	bool keep_alive_if_stopped = false;
-	int opt, child_status, child_pipe[2];
+	int opt, child_status, last_child_status, child_pipe[2];
 	char **child_argv;
 
 	name = argv[0] ? argv[0] : "bench";
@@ -540,6 +583,7 @@ int main(int argc, char *argv[]) {
 		usage_exit("need to specify a program to benchmark\n");
 
 	child_argv = argv + optind;
+	sigaction(SIGINT, (struct sigaction[]){{.sa_handler = handle_sigint}}, NULL);
 
 	// If count permits, we can also keep track of all measurements to later
 	// calculate the median
@@ -562,6 +606,9 @@ int main(int argc, char *argv[]) {
 		create_pipe(child_pipe);
 		child_status = run_child(child_argv, child_pipe[1], NULL);
 		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
+
+		if (sigints_caught)
+			err_exit("no timed run completed (still warming up)\n");
 	}
 
 	for (unsigned long i = 0; i < count; i++) {
@@ -582,11 +629,35 @@ int main(int argc, char *argv[]) {
 		cpu_sys  = child_rusage.ru_stime.tv_sec * 1e9 + child_rusage.ru_stime.tv_usec * 1e3;
 
 		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
+
+		if (sigints_caught) {
+			if (count > 1) {
+				if (i == 0) {
+					// We wanted to time multiple runs, but none has been
+					// completed "cleanly" (we received a SIGINT before one full
+					// iteration of this timing loop).
+					err_exit("no timed run completed\n");
+				} else {
+					// We wanted to time multiple runs, but we didn't complete
+					// all of them. We can nonetheless report statistics for the
+					// completed ones.
+					errf("%lu out of %lu timed runs completed\n", i, count);
+					count = i;
+					break;
+				}
+			}
+
+			// We get here IFF i == 0 and count == 1. We wanted to only time a
+			// single run, but the user got tired of waiting. Account for it and
+			// report its timing anyway.
+		}
+
 		update_stats(i, wall, cpu_user, cpu_sys);
+		last_child_status = child_status;
 	}
 
 	restore_stderr();
 	timing_report();
 
-	return WIFEXITED(child_status) ? WEXITSTATUS(child_status) : EXIT_SUCCESS;
+	return WIFEXITED(last_child_status) ? WEXITSTATUS(last_child_status) : EXIT_SUCCESS;
 }
