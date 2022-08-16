@@ -34,7 +34,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.1.1"
+#define VERSION_STR "1.2"
 
 // Wrap the real function passing caller line number as argument in order to be
 // able to track down errors
@@ -44,6 +44,7 @@
 #define errf(fmt, ...)      do { restore_stderr(); fprintf(stderr, "%s: " fmt, name, __VA_ARGS__); } while(0)
 #define err_exit(str)       do { restore_stderr(); fprintf(stderr, "%s: " str, name); exit(EXIT_FAILURE); } while(0)
 #define errf_exit(fmt, ...) do { restore_stderr(); fprintf(stderr, "%s: " fmt, name, __VA_ARGS__); exit(EXIT_FAILURE); } while(0)
+#define err_raw(str)        do { restore_stderr(); write(STDERR_FILENO, str, strlen(str)); } while(0)
 
 // Max number of warnings to print for child termination/stop by signal
 #define MAX_CHILD_WARNINGS 3
@@ -68,6 +69,7 @@ static unsigned long count = 1; // Number of timed runs to perform
 static unsigned long wup_count; // Number of warm-up runs to perform
 static int saved_stderr = -1;   // Saved stderr FD in case we mute the child
 static unsigned sigints_caught; // Number of SIGINT signals caught
+static int force_quit_status;   // Child status saved by SIGINT handler in case of force quit
 
 static struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
 static struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
@@ -95,8 +97,8 @@ static void help_exit(void) {
 		"Command line options:\n"
 		"  -n COUNT  number of runs of the benchmarked program\n"
 		"  -w COUNT  number of warm-up runs of the benchmarked program before timed runs\n"
-		"  -k        keep benchmarked program alive if stopped by a signal, instead of\n"
-		"            forcibly killing it (which is the default behavior)\n"
+		"  -k        forcibly kill benchmarked program if stopped by a signal, instead of\n"
+		"            waiting for it to continue (default behavior)\n"
 		"  -q        mute benchmarked program redirecting its stdout/stderr to /dev/null\n"
 		"  -Q        forcibly mute benchmarked program closing its stdout/stderr\n"
 		"  -h        show this help message and exit\n"
@@ -391,7 +393,7 @@ static void create_pipe(int *fds) {
  * the least amount of work possible in order to minimize any overhead in time
  * measurements.
  */
-inline static int run_child(char *const *argv, const int err_pipe_fd, struct rusage *rusage) {
+inline static int run_child(char *const *argv, const int err_pipe_fd, const int wait_flags, struct rusage *rusage) {
 	int child_status;
 
 	child_pid = fork();
@@ -412,7 +414,14 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, struct rus
 	if (child_pid == -1)
 		errf_exit("fork failed: %s\n", strerror(errno));
 
-	while (wait4(child_pid, &child_status, WUNTRACED, rusage) == -1) {
+	while (wait4(child_pid, &child_status, wait_flags, rusage) == (pid_t)-1) {
+		// There is technically a chance to get here after catching 3 SIGINTs.
+		// In such case, if the the child process already exited, it was already
+		// waited for by the waitpid in handle_sigint(), and it does not exist
+		// anymore.
+		if (errno == ECHILD && sigints_caught == 3)
+			return force_quit_status;
+
 		if (errno != EINTR)
 			errf_exit("wait4 failed: %s\n", strerror(errno));
 
@@ -432,9 +441,8 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, struct rus
  * Check child exit status, warn and forcibly kill child if needed, close both
  * ends of the pipe used by the child to report execve failure.
  */
-static void check_child_exit(const int child_status, const int *child_pipe, const bool keep_alive) {
-	bool signaled = WIFSIGNALED(child_status);
-	bool stopped = WIFSTOPPED(child_status);
+static void check_child_exit(const int child_status, const int *child_pipe) {
+	bool signaled, stopped;
 	int child_errno;
 	ssize_t nread;
 
@@ -462,6 +470,9 @@ static void check_child_exit(const int child_status, const int *child_pipe, cons
 	if (WIFEXITED(child_status))
 		return;
 
+	signaled = WIFSIGNALED(child_status);
+	stopped  = WIFSTOPPED(child_status);
+
 	if (signaled || stopped) {
 		if (child_warnings < MAX_CHILD_WARNINGS) {
 			const char *sigdesc;
@@ -473,18 +484,18 @@ static void check_child_exit(const int child_status, const int *child_pipe, cons
 			if (!sigdesc)
 				sigdesc = "unknown signal";
 
-			if (signaled) {
+			if (signaled)
 				errf("child terminated by signal %d (%s)\n", signo, sigdesc);
-			} else {
-				errf("child stopped by signal %d (%s), %s\n", signo, sigdesc,
-					keep_alive ? "kept alive" : "forcibly killing it");
-			}
+			else
+				errf("child stopped by signal %d (%s), forcibly killing it\n", signo, sigdesc);
 
 			if (++child_warnings >= MAX_CHILD_WARNINGS)
 				err("suppressing any further warnings\n");
 		}
 
-		if (stopped && !keep_alive && kill(child_pid, SIGKILL) == -1)
+		// We get WIFSTOPPED(child_status) only if using WUNTRACED, and we use
+		// WUNTRACED only if the user asked us to kill the process if stopped
+		if (stopped && kill(child_pid, SIGKILL) == -1)
 			errf_exit("failed to kill stopped child process (PID=%d)\n", child_pid);
 	} else {
 		// We should never get here as we don't specify WCONTINUED in wait4
@@ -503,41 +514,62 @@ static inline void wall_time(struct timespec *out) {
 /**
  * SIGINT signal handler. Increment global counter to keep track of the number
  * of SIGINTs handled, print a help message and give the user the option to
- * forcibly kill the entire process group in case of unresponsiveness.
+ * forcibly kill the child process in case of unresponsiveness.
  */
 static void handle_sigint(int signo) {
+	pid_t wait_res;
+
 	(void)signo;
 	sigints_caught++;
 
-	restore_stderr();
-	write(STDERR_FILENO, "\n", 1);
-	write(STDERR_FILENO, name, strlen(name));
+	err_raw("\n");
+	err_raw(name);
 
 	switch (sigints_caught) {
 		case 1:
-			write(STDERR_FILENO, ": caught SIGINT (2 more to forcibly quit)\n", 42);
+			err_raw(": caught SIGINT\n");
 			break;
 
 		case 2:
-			write(STDERR_FILENO, ": caught SIGINT (1 more to forcibly quit)\n", 42);
+			err_raw(": caught SIGINT (one more time to force quit)\n");
 			break;
 
 		case 3:
-			// This can be useful if the currently running child process
+			err_raw(": caught SIGINT (force quit)\n");
+
+			// Pointless to handle any more SIGINTs from now on
+			signal(SIGINT, SIG_DFL);
+
+			// Do we still have a child process to wait for?
+			wait_res = waitpid(child_pid, &force_quit_status, WNOHANG);
+			if (wait_res == (pid_t)-1) {
+				if (errno == ECHILD)
+					return;
+
+				err_raw(name);
+				err_raw(": waitpid failed: ");
+				err_raw(strerror(errno));
+				err_raw("\n");
+				_exit(EXIT_FAILURE);
+			}
+
+			// Did the child process already terminate?
+			if (wait_res && (WIFEXITED(force_quit_status) || WIFSIGNALED(force_quit_status)))
+				return;
+
+			// We still have a child process and the user got tired of waiting:
+			// forcibly kill it. This can be useful if the child process
 			// ignores, blocks or weirdly handles SIGINT, refusing to terminate.
-			// Without this functionality, we'd be leaving the user with only
-			// two annoying options: stopping and killing it using job control
-			// commands, or finding and killing it from another shell.
-			write(STDERR_FILENO, ": goodbye!\n", 11);
-			kill(0, SIGKILL);
-			_exit(EXIT_FAILURE);
+			// Without this functionality, we'd be leaving the user with the
+			// annoying task of finding and killing it manually.
+			kill(child_pid, SIGKILL);
 			break;
 	}
 }
 
 int main(int argc, char *argv[]) {
 	unsigned mute_child_level = 0;
-	bool keep_alive_if_stopped = false;
+	int wait_flags = 0;
 	int opt, child_status, last_child_status, child_pipe[2];
 	char **child_argv;
 
@@ -563,7 +595,7 @@ int main(int argc, char *argv[]) {
 				break;
 
 			case 'k':
-				keep_alive_if_stopped = true;
+				wait_flags = WUNTRACED;
 				break;
 
 			case 'v':
@@ -605,8 +637,8 @@ int main(int argc, char *argv[]) {
 		fflush(stderr);
 		mute_child(mute_child_level);
 		create_pipe(child_pipe);
-		child_status = run_child(child_argv, child_pipe[1], NULL);
-		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
+		child_status = run_child(child_argv, child_pipe[1], wait_flags, NULL);
+		check_child_exit(child_status, child_pipe);
 
 		if (sigints_caught)
 			err_exit("no timed run completed (still warming up)\n");
@@ -622,14 +654,14 @@ int main(int argc, char *argv[]) {
 		create_pipe(child_pipe);
 
 		wall_time(&wstart);
-		child_status = run_child(child_argv, child_pipe[1], &child_rusage);
+		child_status = run_child(child_argv, child_pipe[1], wait_flags, &child_rusage);
 		wall_time(&wend);
 
 		wall     = wend.tv_sec * 1e9 + wend.tv_nsec - wstart.tv_sec * 1e9 - wstart.tv_nsec;
 		cpu_user = child_rusage.ru_utime.tv_sec * 1e9 + child_rusage.ru_utime.tv_usec * 1e3;
 		cpu_sys  = child_rusage.ru_stime.tv_sec * 1e9 + child_rusage.ru_stime.tv_usec * 1e3;
 
-		check_child_exit(child_status, child_pipe, keep_alive_if_stopped);
+		check_child_exit(child_status, child_pipe);
 
 		if (sigints_caught) {
 			if (count > 1) {
