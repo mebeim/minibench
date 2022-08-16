@@ -135,11 +135,11 @@ static unsigned long validate_count(const char *s) {
 	count = strtol(s, &endp, 0);
 
 	if (endp == s || *endp)
-		usage_exit("invalid count: not an integer\n");
+		usage_exit("Invalid count: not an integer.\n");
 	if (errno == ERANGE)
-		usage_exit("invalid count: value too large\n");
+		usage_exit("Invalid count: value too large.\n");
 	if (count < 1)
-		usage_exit("invalid count: value must be positive\n");
+		usage_exit("Invalid count: value must be positive.\n");
 
 	return (unsigned long)count;
 }
@@ -168,7 +168,6 @@ static void pptime(const double nsecs) {
  * used everywhere instead of double taking appropriate measures to avoid
  * overflows. I am nonetheless happy as is. Standard deviation is not really a
  * critical statistic.
- *
  */
 static void update_stats_single(struct running_stats *stats, const unsigned long iteration, const double cur) {
 	const double delta = cur - stats->avg;
@@ -404,14 +403,14 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, const int 
 		// We need to communicate failure to the parent in order to abort
 		// execution, but we cannot just exit with a custom error code,
 		// otherwise any child process that actually uses such code would create
-		// a false positive. Furthermore, we can't print anything here since the
-		// above dup2 calls could point std{out,err} to /dev/null. Using a pipe
-		// is a neat and reliable way of solving the problem.
+		// a false positive. Furthermore, we can't print anything here since
+		// std{out,err} could have been closed/redirected. Using a pipe is a
+		// neat and reliable way of solving the problem.
 		write(err_pipe_fd, &errno, sizeof(errno));
 		_exit(EXIT_FAILURE);
 	}
 
-	if (child_pid == -1)
+	if (child_pid == (pid_t)-1)
 		errf_exit("fork failed: %s\n", strerror(errno));
 
 	while (wait4(child_pid, &child_status, wait_flags, rusage) == (pid_t)-1) {
@@ -613,7 +612,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (optind >= argc)
-		usage_exit("need to specify a program to benchmark\n");
+		usage_exit("Need to specify a program to benchmark!\n");
 
 	child_argv = argv + optind;
 	sigaction(SIGINT, (struct sigaction[]){{.sa_handler = handle_sigint}}, NULL);
