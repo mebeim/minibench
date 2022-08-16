@@ -7,7 +7,7 @@ Minimalistic runtime benchmarking utility for Linux written in plain C99.
 
 Design goals:
 
-- Simple, concise, standard-conforming code.
+- Concise, well documented, standard-conforming code.
 - No external dependencies of any kind.
 - Smallest possible overhead (within reasonable limits) for the timing code.
 - Ability to perform warm-up runs before starting timed runs.
@@ -16,6 +16,7 @@ Design goals:
   (i.e. for everything except median).
 - Preservation of the exit status of the benchmarked program when possible.
 - Ability to mute the benchmarked program's output (stdout and stderr).
+- Ability to early stop a running benchmarking session through CTRL+C (SIGINT).
 - Human readable, pretty-printed output.
 
 Building and installation
