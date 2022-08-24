@@ -10,7 +10,7 @@ endif
 
 bench: bench.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	strip -R.comment $@
+	strip $@
 
 install: bench
 	install $< $$HOME/.local/bin
