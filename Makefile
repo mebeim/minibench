@@ -1,5 +1,10 @@
 CFLAGS  := -std=c99 -O3 -Wall -Wextra -pedantic -pedantic-errors
-LDFLAGS := -Wl,-z,relro,-z,now -lm
+LDFLAGS := -lm
+
+# ld has no -z option on macOS
+ifneq ($(shell uname -s),Darwin)
+	LDFLAGS += -Wl,-z,relro,-z,now
+endif
 
 .PHONY: clean install uninstall
 
