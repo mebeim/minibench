@@ -17,6 +17,7 @@
  */
 
 #define _DEFAULT_SOURCE         // wait4
+#define _DARWIN_C_SOURCE        // wait4 (macOS Xcode)
 #define _POSIX_C_SOURCE 200809L // clock_gettime, strsignal
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +35,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.2"
+#define VERSION_STR "1.2.1"
 
 // Wrap the real function passing caller line number as argument in order to be
 // able to track down errors
