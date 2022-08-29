@@ -35,7 +35,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
-#define VERSION_STR "1.2.1"
+#define VERSION_STR "1.2.2"
 
 // Wrap the real function passing caller line number as argument in order to be
 // able to track down errors
@@ -146,17 +146,6 @@ static unsigned long validate_count(const char *s) {
 }
 
 /**
- * Convert and print nanoseconds in human-readable form.
- */
-static void pptime(const double nsecs) {
-	if      (nsecs <  5e-4) { fputs("      0  ", stderr);              }
-	else if (nsecs <  1e3 ) { fprintf(stderr, "%7.3fns", nsecs);       }
-	else if (nsecs <  1e6 ) { fprintf(stderr, "%7.3fus", nsecs / 1e3); }
-	else if (nsecs <  1e9 ) { fprintf(stderr, "%7.3fms", nsecs / 1e6); }
-	else                    { fprintf(stderr, "%7.3fs ", nsecs / 1e9); }
-}
-
-/**
  * Update a single category of running statistics using Welford's online
  * algorithm.
  *
@@ -207,6 +196,34 @@ static int cmp(const void *a, const void *b) {
 }
 
 /**
+ * Convert and print nanoseconds in human-readable form.
+ */
+static void pptime(const double nsecs) {
+	unsigned h, m, s;
+
+	if (nsecs >= 60e9) {
+		s = nsecs / 1e9;
+		h = s / 3600;
+		s %= 3600;
+		m = s / 60;
+		s %= 60;
+
+		if (h)
+			fprintf(stderr, "%2uh %02um %02us ", h, m, s);
+		else
+			fprintf(stderr, "    %2um %02us ", m, s);
+
+		return;
+	}
+
+	if      (nsecs <  5e-4) { fputs("         0  ", stderr);             }
+	else if (nsecs <  1e3 ) { fprintf(stderr, "   %7.3fns", nsecs);       }
+	else if (nsecs <  1e6 ) { fprintf(stderr, "   %7.3fus", nsecs / 1e3); }
+	else if (nsecs <  1e9 ) { fprintf(stderr, "   %7.3fms", nsecs / 1e6); }
+	else                    { fprintf(stderr, "   %7.3fs ", nsecs / 1e9); }
+}
+
+/**
  * Finalize statistics with appropriate calculations and pretty-print a detailed
  * timing report.
  */
@@ -217,20 +234,20 @@ static void timing_report(void) {
 	// benchmarked program did not end its last line of output with a newline
 
 	if (count == 1) {
-		fputs("\n------------------------------------------------\n", stderr);
-		fputs("         Wall        CPU       User     System\nTime  ", stderr);
-		pptime(wall_stats.tot);     fputs("  ", stderr);
-		pptime(cpu_stats.tot);      fputs("  ", stderr);
-		pptime(cpu_user_stats.tot); fputs("  ", stderr);
+		fputs("\n---------------------------------------------------------\n", stderr);
+		fputs("            Wall          CPU         User       System\nTime  ", stderr);
+		pptime(wall_stats.tot);     fputc(' ', stderr);
+		pptime(cpu_stats.tot);      fputc(' ', stderr);
+		pptime(cpu_user_stats.tot); fputc(' ', stderr);
 		pptime(cpu_sys_stats.tot);  fputc('\n', stderr);
 		return;
 	}
 
-	fprintf(stderr, "\n-----------[ Timing report for %ld runs ]------------\n", count);
-	fputs("            Wall        CPU       User     System\nTotal    ", stderr);
-	pptime(wall_stats.tot);     fputs("  ", stderr);
-	pptime(cpu_stats.tot);      fputs("  ", stderr);
-	pptime(cpu_user_stats.tot); fputs("  ", stderr);
+	fprintf(stderr, "\n----------------[ Timing report for %ld runs ]----------------\n", count);
+	fputs("               Wall          CPU         User       System\nTotal    ", stderr);
+	pptime(wall_stats.tot);     fputc(' ', stderr);
+	pptime(cpu_stats.tot);      fputc(' ', stderr);
+	pptime(cpu_user_stats.tot); fputc(' ', stderr);
 	pptime(cpu_sys_stats.tot);  fputc('\n', stderr);
 
 	wall_std     = sqrt(wall_stats.m2 / count);
@@ -263,34 +280,34 @@ static void timing_report(void) {
 		}
 
 		fputs("Median   ", stderr);
-		pptime(wall_mid);     fputs("  ", stderr);
-		pptime(cpu_mid);      fputs("  ", stderr);
-		pptime(cpu_user_mid); fputs("  ", stderr);
+		pptime(wall_mid);     fputc(' ', stderr);
+		pptime(cpu_mid);      fputc(' ', stderr);
+		pptime(cpu_user_mid); fputc(' ', stderr);
 		pptime(cpu_sys_mid);  fputc('\n', stderr);
 	}
 
 	fputs("Average  ", stderr);
-	pptime(wall_stats.avg);     fputs("  ", stderr);
-	pptime(cpu_stats.avg);      fputs("  ", stderr);
-	pptime(cpu_user_stats.avg); fputs("  ", stderr);
+	pptime(wall_stats.avg);     fputc(' ', stderr);
+	pptime(cpu_stats.avg);      fputc(' ', stderr);
+	pptime(cpu_user_stats.avg); fputc(' ', stderr);
 	pptime(cpu_sys_stats.avg);  fputc('\n', stderr);
 
 	fputs("Std dev  ", stderr);
-	pptime(wall_std);     fputs("  ", stderr);
-	pptime(cpu_std);      fputs("  ", stderr);
-	pptime(cpu_user_std); fputs("  ", stderr);
+	pptime(wall_std);     fputc(' ', stderr);
+	pptime(cpu_std);      fputc(' ', stderr);
+	pptime(cpu_user_std); fputc(' ', stderr);
 	pptime(cpu_sys_std);  fputc('\n', stderr);
 
 	fputs("Minimum  ", stderr);
-	pptime(wall_stats.min);     fputs("  ", stderr);
-	pptime(cpu_stats.min);      fputs("  ", stderr);
-	pptime(cpu_user_stats.min); fputs("  ", stderr);
+	pptime(wall_stats.min);     fputc(' ', stderr);
+	pptime(cpu_stats.min);      fputc(' ', stderr);
+	pptime(cpu_user_stats.min); fputc(' ', stderr);
 	pptime(cpu_sys_stats.min);  fputc('\n', stderr);
 
 	fputs("Maximum  ", stderr);
-	pptime(wall_stats.max);     fputs("  ", stderr);
-	pptime(cpu_stats.max);      fputs("  ", stderr);
-	pptime(cpu_user_stats.max); fputs("  ", stderr);
+	pptime(wall_stats.max);     fputc(' ', stderr);
+	pptime(cpu_stats.max);      fputc(' ', stderr);
+	pptime(cpu_user_stats.max); fputc(' ', stderr);
 	pptime(cpu_sys_stats.max);  fputc('\n', stderr);
 }
 
