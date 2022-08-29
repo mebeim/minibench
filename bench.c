@@ -353,7 +353,7 @@ static void redirect_to_devnull(void) {
  * child stdout and stderr setting FD_CLOEXEC on them in the parent.
  */
 static void mute_child(const unsigned level) {
-	static bool cloexec_once = false;
+	static bool cloexec_once = true;
 
 	// This will need to be done once before each run, because we could have
 	// restored stderr for printing a warning between any two runs
