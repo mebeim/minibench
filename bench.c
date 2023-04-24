@@ -18,7 +18,7 @@
 
 #define _DEFAULT_SOURCE         // wait4
 #define _DARWIN_C_SOURCE        // wait4 (macOS Xcode)
-#define _POSIX_C_SOURCE 200809L // clock_gettime, stpcpy, strsignal
+#define _POSIX_C_SOURCE 200809L // clock_gettime, stpcpy, strsignal, waitid
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -74,7 +74,6 @@ static unsigned long count = 1; // Number of timed runs to perform
 static unsigned long wup_count; // Number of warm-up runs to perform
 static int saved_stderr = -1;   // Saved stderr FD in case we mute the child
 static unsigned sigints_caught; // Number of SIGINT signals caught
-static int force_quit_status;   // Child status saved by SIGINT handler in case of force quit
 
 static struct running_stats wall_stats     = {.min = INFINITY, .max = -INFINITY};
 static struct running_stats cpu_stats      = {.min = INFINITY, .max = -INFINITY};
@@ -478,13 +477,6 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, const int 
 		errf_exit("fork failed: %s\n", strerror(errno));
 
 	while (wait4(child_pid, &child_status, wait_flags, rusage) == (pid_t)-1) {
-		// There is technically a chance to get here after catching 3 SIGINTs.
-		// In such case, if the the child process already exited, it was already
-		// waited for by the waitpid in handle_sigint(), and it does not exist
-		// anymore.
-		if (errno == ECHILD && sigints_caught == 3)
-			return force_quit_status;
-
 		if (errno != EINTR)
 			errf_exit("wait4 failed: %s\n", strerror(errno));
 
@@ -580,7 +572,7 @@ static inline void wall_time(struct timespec *out) {
  * forcibly kill the child process in case of unresponsiveness.
  */
 static void handle_sigint(int signo) {
-	pid_t wait_res;
+	siginfo_t info = { .si_pid = 0 };
 
 	(void)signo;
 	sigints_caught++;
@@ -604,20 +596,19 @@ static void handle_sigint(int signo) {
 			signal(SIGINT, SIG_DFL);
 
 			// Do we still have a child process to wait for?
-			wait_res = waitpid(child_pid, &force_quit_status, WNOHANG);
-			if (wait_res == (pid_t)-1) {
+			if (waitid(P_PID, child_pid, &info, WNOHANG|WNOWAIT|WEXITED) == -1) {
 				if (errno == ECHILD)
 					return;
 
 				err_raw(name);
-				err_raw(": waitpid failed: ");
+				err_raw(": waitid failed: ");
 				err_raw(strerror(errno));
 				err_raw("\n");
 				_exit(EXIT_FAILURE);
 			}
 
 			// Did the child process already terminate?
-			if (wait_res && (WIFEXITED(force_quit_status) || WIFSIGNALED(force_quit_status)))
+			if (info.si_pid && (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED))
 				return;
 
 			// We still have a child process and the user got tired of waiting:
