@@ -18,7 +18,7 @@
 
 #define _DEFAULT_SOURCE         // wait4
 #define _DARWIN_C_SOURCE        // wait4 (macOS Xcode)
-#define _POSIX_C_SOURCE 200809L // clock_gettime, strsignal
+#define _POSIX_C_SOURCE 200809L // clock_gettime, stpcpy, strsignal
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -39,6 +39,7 @@
 
 // Wrap the real function passing caller line number as argument in order to be
 // able to track down errors
+static void restore_stderr_track_caller(const int);
 #define restore_stderr() restore_stderr_track_caller(__LINE__)
 
 #define err(str)            do { restore_stderr(); fprintf(stderr, "%s: " str, name); } while(0)
@@ -63,7 +64,10 @@ struct running_stats {
 	double *hist;
 };
 
-static char *name;              // Saved argv[0]
+extern char **environ;
+
+static const char *name;        // Saved argv[0]
+static char *program_path;      // Path of program to benchmark (passed to execve)
 static pid_t child_pid;         // Saved current child PID
 static unsigned child_warnings; // Number of child warnings printed so far
 static unsigned long count = 1; // Number of timed runs to perform
@@ -312,6 +316,48 @@ static void timing_report(void) {
 }
 
 /**
+ * Search for the program to execute under any of the paths specified in $PATH,
+ * mimicking the behavior of execvp(), and cache the path in program_path to be
+ * used later when executing the child. Exit if the program is not found. This
+ * allows for faster exec using execve() instead of execvp().
+ */
+static void locate_program(char *const program_name) {
+	char *paths, *path;
+	size_t name_len;
+
+	if (strchr(program_name, '/')) {
+		program_path = program_name;
+		return;
+	}
+
+	paths = getenv("PATH");
+	paths = strdup(paths ? paths : "/usr/local/bin:/usr/bin:/bin");
+	name_len = strlen(program_name);
+
+	for (path = strtok(paths, ":"); path != NULL; path = strtok(NULL, ":")) {
+		if (*path == '\0')
+			path = ".";
+
+		program_path = malloc(strlen(path) + name_len + 2);
+		stpcpy(stpcpy(stpcpy(program_path, path), "/"), program_name);
+
+		if (access(program_path, X_OK) == 0)
+			break;
+
+		if (errno != EACCES && errno != ENOENT && errno != ENOTDIR)
+			errf("unexpected error accessing %s: %s\n", program_path, strerror(errno));
+
+		free(program_path);
+		program_path = NULL;
+	}
+
+	free(paths);
+
+	if (program_path == NULL)
+		errf_exit("program not found in PATH: %s\n", program_name);
+}
+
+/**
  * Restore previously duped stderr file descriptor to STDERR_FILENO if needed.
  */
 static void restore_stderr_track_caller(const int caller_lineno) {
@@ -416,7 +462,7 @@ inline static int run_child(char *const *argv, const int err_pipe_fd, const int 
 	child_pid = fork();
 
 	if (child_pid == 0) {
-		execvp(*argv, argv);
+		execve(program_path, argv, environ);
 
 		// We need to communicate failure to the parent in order to abort
 		// execution, but we cannot just exit with a custom error code,
@@ -633,6 +679,7 @@ int main(int argc, char *argv[]) {
 		usage_exit("Need to specify a program to benchmark!\n");
 
 	child_argv = argv + optind;
+	locate_program(*child_argv);
 	sigaction(SIGINT, (struct sigaction[]){{.sa_handler = handle_sigint}}, NULL);
 
 	// If count permits, we can also keep track of all measurements to later
