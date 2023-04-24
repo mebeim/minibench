@@ -55,4 +55,4 @@ On error, an error message will be printed before exiting with status 1.
 
 ---
 
-*Copyright &copy; 2022 Marco Bonelli. Licensed under the Apache License v2.0.*
+*Copyright &copy; 2022-2023 Marco Bonelli. Licensed under the Apache License v2.0.*
